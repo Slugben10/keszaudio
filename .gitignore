@@ -2,3 +2,5 @@ run_app.py
 run_app.sh
 run.py
 .venv/
+dist/
+build/
