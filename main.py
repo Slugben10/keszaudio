@@ -361,6 +361,39 @@ class AudioProcessor:
         if self.update_callback:
             self.update_callback(message, percent)
     
+    def convert_audio_file(self, file_path, target_format=".wav"):
+        """Convert audio file to a different format using FFmpeg."""
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Audio file not found: {file_path}")
+            
+        # Check if FFmpeg is available
+        try:
+            subprocess.run(
+                ["ffmpeg", "-version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True
+            )
+        except (subprocess.SubprocessError, FileNotFoundError):
+            raise RuntimeError("FFmpeg is required for audio conversion but was not found.")
+        
+        # Create output file path with new extension
+        output_path = os.path.splitext(file_path)[0] + target_format
+        
+        # Run conversion
+        self.update_status(f"Converting audio to {target_format} format...", percent=10)
+        try:
+            subprocess.run(
+                ["ffmpeg", "-i", file_path, "-y", output_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True
+            )
+            self.update_status(f"Conversion complete: {os.path.basename(output_path)}", percent=20)
+            return output_path
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"Error converting audio file: {e.stderr.decode() if hasattr(e, 'stderr') else str(e)}")
+    
     def transcribe_audio(self, audio_path, language=None):
         """Transcribe audio file using OpenAI's Whisper API."""
         try:
@@ -370,6 +403,26 @@ class AudioProcessor:
                 return error_msg
             
             self.update_status("Transcribing audio...", percent=10)
+            
+            # Get file extension for validation
+            file_ext = os.path.splitext(audio_path)[1].lower()
+            supported_formats = ['.flac', '.m4a', '.mp3', '.mp4', '.mpeg', '.mpga', '.oga', '.ogg', '.wav', '.webm']
+            
+            # Check if format needs conversion
+            if file_ext not in supported_formats:
+                self.update_status(f"File format {file_ext} not directly supported, attempting conversion...", percent=5)
+                try:
+                    audio_path = self.convert_audio_file(audio_path)
+                except Exception as e:
+                    raise ValueError(f"Unable to convert unsupported file format: {str(e)}")
+            
+            # M4A files often have issues with OpenAI API, try to convert them automatically
+            if file_ext == '.m4a':
+                self.update_status("M4A files can have compatibility issues, attempting to convert for better results...", percent=5)
+                try:
+                    audio_path = self.convert_audio_file(audio_path)
+                except Exception as e:
+                    self.update_status("Could not convert M4A file. Attempting to use original file...", percent=10)
             
             with open(audio_path, "rb") as audio_file:
                 response = self.client.audio.transcriptions.create(
@@ -1003,97 +1056,728 @@ class MainFrame(wx.Frame):
             # Start transcription in a thread
             threading.Thread(target=self.transcribe_audio, args=(audio_path,), daemon=True).start()
     
-    def transcribe_audio(self, audio_path):
-        if not self.client:
-            wx.CallAfter(self.show_error, "OpenAI API key not set. Please set it in Settings.")
-            wx.CallAfter(self.notebook.Enable)
-            wx.CallAfter(self.status_bar.SetStatusText, "Error: API key not set")
-            return
-        
+    def transcribe_audio(self, audio_path, language=None):
+        """Transcribe audio file using OpenAI's Whisper API."""
         try:
-            # Step 1: Transcribe audio using OpenAI Whisper
-            language_display = "English" if self.language == "en" else "Hungarian"
-            wx.CallAfter(self.status_bar.SetStatusText, f"Transcribing audio with Whisper in {language_display}...")
+            if not self.client:
+                error_msg = "Error: OpenAI client not initialized"
+                self.transcript = error_msg
+                return error_msg
+            
+            self.update_status("Transcribing audio...", percent=10)
+            
+            # Get file extension for validation
+            file_ext = os.path.splitext(audio_path)[1].lower()
+            supported_formats = ['.flac', '.m4a', '.mp3', '.mp4', '.mpeg', '.mpga', '.oga', '.ogg', '.wav', '.webm']
+            
+            # Check if format needs conversion
+            if file_ext not in supported_formats:
+                self.update_status(f"File format {file_ext} not directly supported, attempting conversion...", percent=5)
+                try:
+                    audio_path = self.convert_audio_file(audio_path)
+                except Exception as e:
+                    raise ValueError(f"Unable to convert unsupported file format: {str(e)}")
+            
+            # M4A files often have issues with OpenAI API, try to convert them automatically
+            if file_ext == '.m4a':
+                self.update_status("M4A files can have compatibility issues, attempting to convert for better results...", percent=5)
+                try:
+                    audio_path = self.convert_audio_file(audio_path)
+                except Exception as e:
+                    self.update_status("Could not convert M4A file. Attempting to use original file...", percent=10)
             
             with open(audio_path, "rb") as audio_file:
-                # Send to OpenAI for transcription
                 response = self.client.audio.transcriptions.create(
                     file=audio_file,
-                    model="whisper-1",
-                    language=self.language,  # Use selected language (en or hu)
-                    response_format="verbose_json",
-                    timestamp_granularities=["word", "segment"]
+                    model=WHISPER_MODEL,
+                    language=language
                 )
             
-            # Get basic transcript
-            self.transcript = response.text
-            self.speakers = []
+            self.update_status("Transcription complete", percent=100)
+            self.transcript = response.text  # Store the transcript as an attribute
+            return response.text
+        except Exception as e:
+            error_msg = f"Error: {str(e)}"
+            self.update_status(f"Error transcribing audio: {str(e)}", percent=0)
+            self.transcript = error_msg  # Set transcript to error message to avoid None
+            return error_msg
             
-            # Step 2: Perform speaker diarization if available
-            if DIARIZATION_AVAILABLE:
-                wx.CallAfter(self.status_bar.SetStatusText, "Analyzing speakers...")
+    def _get_ffmpeg_install_instructions(self):
+        """Return platform-specific FFmpeg installation instructions."""
+        import platform
+        system = platform.system().lower()
+        
+        if system == 'darwin':  # macOS
+            return "On macOS:\n1. Install Homebrew from https://brew.sh if you don't have it\n2. Run: brew install ffmpeg"
+        elif system == 'windows':
+            return "On Windows:\n1. Download from https://ffmpeg.org/download.html\n2. Add to PATH or use a package manager like Chocolatey (choco install ffmpeg)"
+        elif system == 'linux':
+            return "On Linux:\n- Ubuntu/Debian: sudo apt install ffmpeg\n- Fedora: sudo dnf install ffmpeg\n- Arch: sudo pacman -S ffmpeg"
+        else:
+            return "Please download FFmpeg from https://ffmpeg.org/download.html"
+
+class MainApp(wx.App):
+    def OnInit(self):
+        try:
+            # Force GUI to work on macOS without Framework build
+            self.SetExitOnFrameDelete(True)
+            self.frame = MainFrame(None, title="AI Assistant", base_dir=APP_BASE_DIR)
+            self.frame.Show()
+            # Set top window explicitly for macOS
+            self.SetTopWindow(self.frame)
+            return True
+        except AttributeError as e:
+            # Add missing methods to MainFrame that might be referenced but don't exist
+            if "'MainFrame' object has no attribute" in str(e):
+                attr_name = str(e).split("'")[-2]
+                print(f"Adding missing attribute: {attr_name}")
+                setattr(MainFrame, attr_name, lambda self, *args, **kwargs: None)
+                # Try again
+                return self.OnInit()
+            else:
+                print(f"Error initializing main frame: {e}")
+                return False
+        except Exception as e:
+            print(f"Error initializing main frame: {e}")
+            return False
+
+class MainFrame(wx.Frame):
+    def __init__(self, parent, title, base_dir):
+        super(MainFrame, self).__init__(parent, title=title, size=(1200, 800))
+        
+        # Initialize config manager
+        self.config_manager = ConfigManager(base_dir)
+        
+        # Initialize attributes
+        self.client = None
+        self.api_key = self.config_manager.get_api_key()
+        self.language = self.config_manager.get_language() or "en"
+        self.hf_token = self.config_manager.get_pyannote_token()
+        
+        # Initialize other attributes that might be referenced
+        self.identify_speakers_btn = None
+        self.speaker_id_help_text = None
+        self.transcript = None
+        self.last_audio_path = None
+        
+        # Check for API key and initialize client
+        self.initialize_openai_client()
+        
+        # Initialize processors
+        self.audio_processor = AudioProcessor(client, self.update_status, self.config_manager)
+        self.llm_processor = LLMProcessor(client, self.config_manager, self.update_status)
+        
+        # Set up the UI - use either create_ui or init_ui, not both
+        # Initialize menus and status bar using create_ui
+        self.create_ui() # Create notebook and panels
+        
+        # Event bindings
+        self.bind_events()
+        
+        # Center the window
+        self.Centre()
+        
+        # Status update
+        self.update_status("Application ready.", percent=0)
+        
+        # Display info about supported audio formats
+        wx.CallLater(1000, self.show_format_info)
+        
+        # Check for PyAnnote and display installation message if needed
+        wx.CallLater(1500, self.check_pyannote)
+    
+    def initialize_openai_client(self):
+        """Initialize OpenAI client with API key."""
+        global client
+        api_key = self.config_manager.get_api_key()
+        
+        if not api_key:
+            dlg = wx.TextEntryDialog(self, "Please enter your OpenAI API key:", "API Key Required")
+            if dlg.ShowModal() == wx.ID_OK:
+                api_key = dlg.GetValue()
+                self.config_manager.set_api_key(api_key)
+            dlg.Destroy()
+        
+        try:
+            client = OpenAI(api_key=api_key)
+        except Exception as e:
+            wx.MessageBox(f"Error initializing OpenAI client: {str(e)}", "Error", wx.OK | wx.ICON_ERROR)
+            
+    def create_ui(self):
+        """Create the user interface."""
+        # Create status bar
+        self.status_bar = self.CreateStatusBar()
+        self.status_bar.SetStatusText("Ready")
+        
+        # Create menu bar
+        menu_bar = wx.MenuBar()
+        
+        # File menu
+        file_menu = wx.Menu()
+        
+        # Audio submenu
+        audio_menu = wx.Menu()
+        upload_audio_item = audio_menu.Append(wx.ID_ANY, "&Upload Audio File", "Upload audio file for transcription")
+        self.Bind(wx.EVT_MENU, self.on_upload_audio, upload_audio_item)
+        
+        file_menu.AppendSubMenu(audio_menu, "&Audio")
+        
+        # Document submenu
+        doc_menu = wx.Menu()
+        upload_doc_item = doc_menu.Append(wx.ID_ANY, "&Upload Document", "Upload document for LLM context")
+        select_docs_item = doc_menu.Append(wx.ID_ANY, "&Select Documents", "Select documents to load into context")
+        
+        self.Bind(wx.EVT_MENU, self.on_upload_document, upload_doc_item)
+        self.Bind(wx.EVT_MENU, self.on_select_documents, select_docs_item)
+        
+        file_menu.AppendSubMenu(doc_menu, "&Documents")
+        
+        # Settings menu item
+        settings_item = file_menu.Append(wx.ID_ANY, "&Settings", "Application settings")
+        self.Bind(wx.EVT_MENU, self.on_settings, settings_item)
+        
+        # Exit menu item
+        exit_item = file_menu.Append(wx.ID_EXIT, "E&xit", "Exit application")
+        self.Bind(wx.EVT_MENU, self.on_exit, exit_item)
+        
+        menu_bar.Append(file_menu, "&File")
+        
+        # Help menu
+        help_menu = wx.Menu()
+        about_item = help_menu.Append(wx.ID_ABOUT, "&About", "About this application")
+        self.Bind(wx.EVT_MENU, self.on_about, about_item)
+        
+        menu_bar.Append(help_menu, "&Help")
+        
+        self.SetMenuBar(menu_bar)
+        
+        # Create notebook for tabbed interface
+        self.notebook = wx.Notebook(self)
+        
+        # Create panels for each tab
+        self.audio_panel = wx.Panel(self.notebook)
+        self.chat_panel = wx.Panel(self.notebook)
+        self.settings_panel = wx.Panel(self.notebook)
+        
+        # Add panels to notebook
+        self.notebook.AddPage(self.audio_panel, "Audio Processing")
+        self.notebook.AddPage(self.chat_panel, "Chat")
+        self.notebook.AddPage(self.settings_panel, "Settings")
+        
+        # Bind the notebook page change event
+        self.notebook.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED, self.on_notebook_page_changed)
+        
+        # Create UI for each panel
+        if hasattr(self, 'create_audio_panel'):
+            self.create_audio_panel()
+        
+        # Add placeholder method if not exists
+        if not hasattr(self, 'create_chat_panel'):
+            def create_chat_panel(self):
+                chat_sizer = wx.BoxSizer(wx.VERTICAL)
+                placeholder = wx.StaticText(self.chat_panel, label="Chat panel")
+                chat_sizer.Add(placeholder, 1, wx.EXPAND | wx.ALL, 5)
+                self.chat_panel.SetSizer(chat_sizer)
+            self.create_chat_panel = types.MethodType(create_chat_panel, self)
+        self.create_chat_panel()
+        
+        # Add placeholder method if not exists
+        if not hasattr(self, 'create_settings_panel'):
+            def create_settings_panel(self):
+                settings_sizer = wx.BoxSizer(wx.VERTICAL)
+                placeholder = wx.StaticText(self.settings_panel, label="Settings panel")
+                settings_sizer.Add(placeholder, 1, wx.EXPAND | wx.ALL, 5)
+                self.settings_panel.SetSizer(settings_sizer)
+            self.create_settings_panel = types.MethodType(create_settings_panel, self)
+        self.create_settings_panel()
+        
+        # Main sizer
+        main_sizer = wx.BoxSizer(wx.VERTICAL)
+        main_sizer.Add(self.notebook, 1, wx.EXPAND | wx.ALL, 5)
+        
+        self.SetSizer(main_sizer)
+        
+    def on_notebook_page_changed(self, event):
+        """Handle notebook page change event."""
+        old_page = event.GetOldSelection()
+        new_page = event.GetSelection()
+        
+        # If user switched from settings to audio tab, update the speaker ID button styling
+        if old_page == 2 and new_page == 0:  # 2 = settings, 0 = audio
+            self.identify_speakers_btn.SetLabel(self.get_speaker_id_button_label())
+            self.speaker_id_help_text.SetLabel(self.get_speaker_id_help_text())
+            self.update_speaker_id_button_style()
+            self.audio_panel.Layout()
+            
+        event.Skip()  # Allow default event processing
+    
+    def get_speaker_id_button_label(self):
+        """Get label for speaker identification button based on token availability."""
+        has_token = bool(self.config_manager.get_pyannote_token())
+        return "Identify Speakers (Advanced)" if has_token else "Identify Speakers (Basic)"
+    
+    def get_speaker_id_help_text(self):
+        """Get help text for speaker identification based on token availability."""
+        has_token = bool(self.config_manager.get_pyannote_token())
+        if has_token:
+            return "Using PyAnnote for advanced speaker identification"
+        else:
+            return "Using basic speaker identification (Add PyAnnote token in Settings for better results)"
+            
+    def update_speaker_id_button_style(self):
+        """Update the style of the speaker identification button based on token availability."""
+        if hasattr(self, 'identify_speakers_btn'):
+            has_token = bool(self.config_manager.get_pyannote_token())
+            if has_token:
+                self.identify_speakers_btn.SetBackgroundColour(wx.Colour(50, 200, 50))
+            else:
+                self.identify_speakers_btn.SetBackgroundColour(wx.NullColour)
+    
+    def check_api_key(self):
+        """Check if API key is available and initialize the client."""
+        api_key = self.config_manager.get_api_key()
+        
+        if api_key:
+            try:
+                self.client = OpenAI(api_key=api_key)
+                self.status_bar.SetStatusText("API Key loaded from configuration")
+                return
+            except Exception as e:
+                print(f"Error loading API key from configuration: {e}")
+        
+        # If API key is not in config or invalid, ask the user
+        self.show_api_key_dialog()
+    
+    def show_api_key_dialog(self):
+        """Show dialog to enter API key."""
+        dialog = wx.TextEntryDialog(self, "Please enter your OpenAI API Key:", "API Key Required")
+        if dialog.ShowModal() == wx.ID_OK:
+            api_key = dialog.GetValue().strip()
+            if api_key:
+                # Save the API key to configuration
+                self.config_manager.set_api_key(api_key)
                 
                 try:
-                    # Check if HuggingFace token exists in environment
-                    hf_token = self.hf_token
-                    
-                    if not hf_token:
-                        # Ask for HuggingFace token if not present
-                        self.show_hf_token_dialog()
-                        return
-                    
-                    # Load the speaker diarization pipeline
-                    # Speaker diarization works independently of language
-                    diarization_pipeline = Pipeline.from_pretrained(
-                        "pyannote/speaker-diarization-3.0",
-                        use_auth_token=hf_token
-                    )
-                    
-                    # Run the diarization pipeline on the audio file
-                    diarization = diarization_pipeline(audio_path)
-                    
-                    # Process diarization results
-                    speaker_segments = {}
-                    
-                    # Extract speaker segments from diarization
-                    for turn, _, speaker in diarization.itertracks(yield_label=True):
-                        if speaker not in self.speakers:
-                            self.speakers.append(speaker)
-                            speaker_segments[speaker] = []
-                        
-                        speaker_segments[speaker].append((turn.start, turn.end))
-                    
-                    # Initialize speaker names with default values - use localized naming
-                    if self.language == "hu":
-                        speaker_prefix = "Beszélő"  # Hungarian for "Speaker"
-                    else:
-                        speaker_prefix = "Speaker"
-                        
-                    self.speaker_names = {speaker: f"{speaker_prefix} {i+1}" for i, speaker in enumerate(self.speakers)}
-                    
-                    # Step 3: Combine transcription with speaker information
-                    formatted_transcript = self.combine_transcript_with_speakers(response, speaker_segments)
-                    self.transcript = formatted_transcript
-                    
+                    self.client = OpenAI(api_key=api_key)
+                    self.status_bar.SetStatusText("API Key saved")
                 except Exception as e:
-                    wx.CallAfter(self.show_error, f"Error during speaker diarization: {str(e)}\nFalling back to basic transcription.")
-                    self._fallback_speaker_detection()
+                    wx.MessageBox(f"Error initializing OpenAI client: {e}", "Error", wx.OK | wx.ICON_ERROR)
+                    self.show_api_key_dialog()
             else:
-                # If diarization is not available, use basic speaker detection
-                self._fallback_speaker_detection()
-            
-            # Update UI
-            wx.CallAfter(self.update_transcript_display)
-            wx.CallAfter(self.update_speaker_list)
-            wx.CallAfter(self.notebook.Enable)
-            wx.CallAfter(self.notebook.SetSelection, 1)  # Switch to transcription tab
-            wx.CallAfter(self.status_bar.SetStatusText, "Transcription complete")
-            
-        except Exception as e:
-            wx.CallAfter(self.show_error, f"Error transcribing audio: {str(e)}")
-            wx.CallAfter(self.notebook.Enable)
-            wx.CallAfter(self.status_bar.SetStatusText, "Error")
+                wx.MessageBox("API Key is required to use this application.", "Error", wx.OK | wx.ICON_ERROR)
+                self.show_api_key_dialog()
+        else:
+            wx.MessageBox("API Key is required to use this application.", "Error", wx.OK | wx.ICON_ERROR)
+            self.show_api_key_dialog()
+        dialog.Destroy()
     
+    def init_ui(self):
+        # Create status bar
+        self.status_bar = self.CreateStatusBar()
+        self.status_bar.SetStatusText("Ready")
+        
+        # Create menu bar
+        menu_bar = wx.MenuBar()
+        
+        # File menu
+        file_menu = wx.Menu()
+        
+        # Audio submenu
+        audio_menu = wx.Menu()
+        upload_audio_item = audio_menu.Append(wx.ID_ANY, "&Upload Audio File", "Upload audio file for transcription")
+        self.Bind(wx.EVT_MENU, self.on_upload_audio, upload_audio_item)
+        
+        file_menu.AppendSubMenu(audio_menu, "&Audio")
+        
+        # Document submenu
+        doc_menu = wx.Menu()
+        upload_doc_item = doc_menu.Append(wx.ID_ANY, "&Upload Document", "Upload document for LLM context")
+        select_docs_item = doc_menu.Append(wx.ID_ANY, "&Select Documents", "Select documents to load into context")
+        
+        self.Bind(wx.EVT_MENU, self.on_upload_document, upload_doc_item)
+        self.Bind(wx.EVT_MENU, self.on_select_documents, select_docs_item)
+        
+        file_menu.AppendSubMenu(doc_menu, "&Documents")
+        
+        # Settings menu item
+        settings_item = file_menu.Append(wx.ID_ANY, "&Settings", "Application settings")
+        self.Bind(wx.EVT_MENU, self.on_settings, settings_item)
+        
+        # Exit menu item
+        exit_item = file_menu.Append(wx.ID_EXIT, "E&xit", "Exit application")
+        self.Bind(wx.EVT_MENU, self.on_exit, exit_item)
+        
+        menu_bar.Append(file_menu, "&File")
+        
+        # Help menu
+        help_menu = wx.Menu()
+        about_item = help_menu.Append(wx.ID_ABOUT, "&About", "About this application")
+        self.Bind(wx.EVT_MENU, self.on_about, about_item)
+        
+        menu_bar.Append(help_menu, "&Help")
+        
+        self.SetMenuBar(menu_bar)
+        
+        # Main panel with notebook
+        self.panel = wx.Panel(self)
+        self.notebook = wx.Notebook(self.panel)
+        
+        # Chat tab
+        self.chat_tab = wx.Panel(self.notebook)
+        chat_sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        # Chat history
+        self.chat_display = wx.TextCtrl(self.chat_tab, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2)
+        
+        # Input area
+        input_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.chat_input = wx.TextCtrl(self.chat_tab, style=wx.TE_MULTILINE)
+        send_button = wx.Button(self.chat_tab, label="Send")
+        
+        input_sizer.Add(self.chat_input, proportion=1, flag=wx.EXPAND | wx.RIGHT, border=5)
+        input_sizer.Add(send_button, proportion=0, flag=wx.EXPAND)
+        
+        chat_sizer.Add(self.chat_display, proportion=1, flag=wx.EXPAND | wx.ALL, border=5)
+        chat_sizer.Add(input_sizer, proportion=0, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=5)
+        
+        self.chat_tab.SetSizer(chat_sizer)
+        
+        # Transcription tab
+        self.transcription_tab = wx.Panel(self.notebook)
+        transcription_sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        # Transcription display
+        self.transcription_display = wx.TextCtrl(self.transcription_tab, style=wx.TE_MULTILINE | wx.TE_RICH2)
+        
+        # Speaker panel
+        speaker_panel = wx.Panel(self.transcription_tab)
+        speaker_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        
+        self.speaker_list = wx.ListCtrl(speaker_panel, style=wx.LC_REPORT)
+        self.speaker_list.InsertColumn(0, "Speaker")
+        self.speaker_list.InsertColumn(1, "Name")
+        
+        speaker_button_sizer = wx.BoxSizer(wx.VERTICAL)
+        rename_speaker_button = wx.Button(speaker_panel, label="Rename Speaker")
+        regenerate_button = wx.Button(speaker_panel, label="Regenerate Transcript")
+        
+        speaker_button_sizer.Add(rename_speaker_button, flag=wx.EXPAND | wx.BOTTOM, border=5)
+        speaker_button_sizer.Add(regenerate_button, flag=wx.EXPAND)
+        
+        speaker_sizer.Add(self.speaker_list, proportion=1, flag=wx.EXPAND | wx.RIGHT, border=5)
+        speaker_sizer.Add(speaker_button_sizer, proportion=0, flag=wx.EXPAND)
+        
+        speaker_panel.SetSizer(speaker_sizer)
+        
+        # Summarization panel
+        summary_panel = wx.Panel(self.transcription_tab)
+        summary_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        
+        templates_label = wx.StaticText(summary_panel, label="Template:")
+        self.templates_combo = wx.ComboBox(summary_panel, choices=["Meeting Notes", "Interview Summary", "Lecture Notes"])
+        summarize_button = wx.Button(summary_panel, label="Summarize")
+        
+        summary_sizer.Add(templates_label, flag=wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, border=5)
+        summary_sizer.Add(self.templates_combo, proportion=1, flag=wx.EXPAND | wx.RIGHT, border=5)
+        summary_sizer.Add(summarize_button, proportion=0, flag=wx.EXPAND)
+        
+        summary_panel.SetSizer(summary_sizer)
+        
+        transcription_sizer.Add(self.transcription_display, proportion=1, flag=wx.EXPAND | wx.ALL, border=5)
+        transcription_sizer.Add(speaker_panel, proportion=0, flag=wx.EXPAND | wx.LEFT | wx.RIGHT, border=5)
+        transcription_sizer.Add(summary_panel, proportion=0, flag=wx.EXPAND | wx.ALL, border=5)
+        
+        self.transcription_tab.SetSizer(transcription_sizer)
+        
+        # Settings tab (NEW)
+        self.settings_tab = wx.Panel(self.notebook)
+        settings_sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        # API Keys section
+        api_box = wx.StaticBox(self.settings_tab, label="API Keys")
+        api_box_sizer = wx.StaticBoxSizer(api_box, wx.VERTICAL)
+        
+        # OpenAI API Key
+        openai_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        openai_label = wx.StaticText(self.settings_tab, label="OpenAI API Key:")
+        self.openai_input = wx.TextCtrl(self.settings_tab, value=self.api_key, style=wx.TE_PASSWORD)
+        
+        openai_sizer.Add(openai_label, flag=wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, border=5)
+        openai_sizer.Add(self.openai_input, proportion=1)
+        
+        # HuggingFace API Key
+        hf_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        hf_label = wx.StaticText(self.settings_tab, label="HuggingFace Token:")
+        self.hf_input = wx.TextCtrl(self.settings_tab, value=self.hf_token, style=wx.TE_PASSWORD)
+        
+        hf_sizer.Add(hf_label, flag=wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, border=5)
+        hf_sizer.Add(self.hf_input, proportion=1)
+        
+        api_box_sizer.Add(openai_sizer, flag=wx.EXPAND | wx.ALL, border=5)
+        api_box_sizer.Add(hf_sizer, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=5)
+        
+        # Language settings section
+        lang_box = wx.StaticBox(self.settings_tab, label="Language Settings")
+        lang_box_sizer = wx.StaticBoxSizer(lang_box, wx.VERTICAL)
+        
+        lang_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        lang_label = wx.StaticText(self.settings_tab, label="Transcription Language:")
+        self.lang_combo = wx.ComboBox(self.settings_tab, 
+                                     choices=["English (en)", "Hungarian (hu)"],
+                                     style=wx.CB_READONLY)
+        
+        # Set initial selection based on saved language
+        if self.language == "hu":
+            self.lang_combo.SetSelection(1)  # Hungarian
+        else:
+            self.lang_combo.SetSelection(0)  # Default to English
+        
+        lang_sizer.Add(lang_label, flag=wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, border=5)
+        lang_sizer.Add(self.lang_combo, proportion=1)
+        
+        lang_box_sizer.Add(lang_sizer, flag=wx.EXPAND | wx.ALL, border=5)
+        
+        # Save button for settings
+        save_button = wx.Button(self.settings_tab, label="Save Settings")
+        save_button.Bind(wx.EVT_BUTTON, self.on_save_settings)
+        
+        # Add all sections
+        settings_sizer.Add(api_box_sizer, flag=wx.EXPAND | wx.ALL, border=10)
+        settings_sizer.Add(lang_box_sizer, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
+        settings_sizer.Add(save_button, flag=wx.ALIGN_RIGHT | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
+        
+        self.settings_tab.SetSizer(settings_sizer)
+        
+        # Add tabs to notebook
+        self.notebook.AddPage(self.chat_tab, "Chat")
+        self.notebook.AddPage(self.transcription_tab, "Transcription")
+        self.notebook.AddPage(self.settings_tab, "Settings")
+        
+        # Main sizer
+        main_sizer = wx.BoxSizer(wx.VERTICAL)
+        main_sizer.Add(self.notebook, proportion=1, flag=wx.EXPAND | wx.ALL, border=5)
+        
+        self.panel.SetSizer(main_sizer)
+        
+        # Bind events
+        send_button.Bind(wx.EVT_BUTTON, self.on_send_message)
+        self.chat_input.Bind(wx.EVT_KEY_DOWN, self.on_key_down)
+        rename_speaker_button.Bind(wx.EVT_BUTTON, self.on_rename_speaker)
+        regenerate_button.Bind(wx.EVT_BUTTON, self.on_regenerate_transcript)
+        summarize_button.Bind(wx.EVT_BUTTON, self.on_summarize)
+    
+    def on_key_down(self, event):
+        key_code = event.GetKeyCode()
+        if key_code == wx.WXK_RETURN and event.ShiftDown():
+            # Allow Shift+Enter to insert a newline
+            event.Skip()
+        elif key_code == wx.WXK_RETURN:
+            # Enter key sends the message
+            self.on_send_message(event)
+        else:
+            event.Skip()
+    
+    def on_send_message(self, event):
+        """Handle sending a message in the chat."""
+        user_input = self.user_input.GetValue()
+        if not user_input:
+            return
+            
+        # Generate response
+        response = self.llm_processor.generate_response(user_input)
+        
+        # Update chat history
+        self.chat_history_text.AppendText(f"You: {user_input}\n")
+        self.chat_history_text.AppendText(f"Assistant: {response}\n\n")
+        
+        # Clear user input
+        self.user_input.SetValue("")
+        
+    def on_clear_chat_history(self, event):
+        """Clear the chat history."""
+        self.llm_processor.clear_chat_history()
+        self.chat_history_text.SetValue("")
+        
+    def on_save_api_key(self, event):
+        """Save the API key."""
+        api_key = self.api_key_input.GetValue()
+        self.config_manager.set_api_key(api_key)
+        wx.MessageBox("API key saved successfully.", "Success", wx.OK | wx.ICON_INFORMATION)
+        
+    def on_save_pyannote_token(self, event):
+        """Save the PyAnnote token."""
+        token = self.pyannote_token_input.GetValue()
+        self.config_manager.set_pyannote_token(token)
+        
+        # Update the speaker identification button style
+        self.identify_speakers_btn.SetLabel(self.get_speaker_id_button_label())
+        self.speaker_id_help_text.SetLabel(self.get_speaker_id_help_text())
+        self.update_speaker_id_button_style()
+        self.audio_panel.Layout()
+        
+        wx.MessageBox("PyAnnote token saved successfully.", "Success", wx.OK | wx.ICON_INFORMATION)
+        
+    def on_save_model(self, event):
+        """Save the selected model."""
+        model = self.model_choice.GetString(self.model_choice.GetSelection())
+        self.config_manager.set_model(model)
+        wx.MessageBox("Model saved successfully.", "Success", wx.OK | wx.ICON_INFORMATION)
+        
+    def on_save_temperature(self, event):
+        """Save the temperature value."""
+        temperature = self.temperature_slider.GetValue() / 10.0
+        self.config_manager.set_temperature(temperature)
+        wx.MessageBox("Temperature saved successfully.", "Success", wx.OK | wx.ICON_INFORMATION)
+        
+    def on_save_language(self, event):
+        """Save the selected language."""
+        language = self.language_settings_choice.GetString(self.language_settings_choice.GetSelection()).lower()
+        self.config_manager.set_language(language)
+        wx.MessageBox("Language saved successfully.", "Success", wx.OK | wx.ICON_INFORMATION)
+        
+    def populate_template_list(self):
+        """Populate the template list with available templates."""
+        self.template_list.Clear()
+        templates = self.config_manager.get_templates()
+        for name in templates.keys():
+            self.template_list.Append(name)
+            
+    def on_add_template(self, event):
+        """Add a new template."""
+        name = self.template_name_input.GetValue()
+        content = self.template_content_input.GetValue()
+        
+        if not name or not content:
+            wx.MessageBox("Please enter both name and content for the template.", "Error", wx.OK | wx.ICON_ERROR)
+            return
+            
+        self.config_manager.add_template(name, content)
+        self.populate_template_list()
+        self.template_name_input.SetValue("")
+        self.template_content_input.SetValue("")
+        
+    def on_remove_template(self, event):
+        """Remove the selected template."""
+        selected = self.template_list.GetSelection()
+        if selected == wx.NOT_FOUND:
+            wx.MessageBox("Please select a template to remove.", "Error", wx.OK | wx.ICON_ERROR)
+            return
+            
+        template_name = self.template_list.GetString(selected)
+        
+        # Confirm deletion
+        dlg = wx.MessageDialog(self, f"Are you sure you want to delete the template '{template_name}'?",
+                              "Confirm Deletion", wx.YES_NO | wx.ICON_QUESTION)
+        if dlg.ShowModal() == wx.ID_YES:
+            # Delete template
+            self.config_manager.remove_template(template_name)
+            
+            # Update lists
+            self.populate_template_list()
+            
+            # Update template choice in audio panel
+            templates = list(self.config_manager.get_templates().keys())
+            self.template_choice.SetItems(["None"] + templates)
+            self.template_choice.SetSelection(0)
+        
+        dlg.Destroy()
+    
+    def on_upload_audio(self, event):
+        # Check if PyAudio is available
+        if not PYAUDIO_AVAILABLE:
+            wx.MessageBox("PyAudio is not available. Recording functionality will be limited.", 
+                         "PyAudio Missing", wx.OK | wx.ICON_WARNING)
+        
+        # File dialog to select audio file - fix wildcard and dialog settings
+        wildcard = "Audio files (*.mp3;*.wav;*.m4a)|*.mp3;*.wav;*.m4a|All files (*.*)|*.*"
+        with wx.FileDialog(
+            self, 
+            message="Choose an audio file",
+            defaultDir=os.path.expanduser("~"),  # Start in user's home directory
+            defaultFile="",
+            wildcard=wildcard,
+            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST
+        ) as file_dialog:
+            
+            # Show the dialog and check if user clicked OK
+            if file_dialog.ShowModal() == wx.ID_CANCEL:
+                return  # User cancelled the dialog
+            
+            # Get the selected file path
+            audio_path = file_dialog.GetPath()
+            self.last_audio_path = audio_path  # Store for potential retry
+            
+            # Show a message that we're processing
+            wx.MessageBox(f"Selected file: {audio_path}\n\nStarting transcription...", 
+                         "Transcription Started", wx.OK | wx.ICON_INFORMATION)
+            
+            # Disable UI during processing
+            self.notebook.Disable()
+            self.status_bar.SetStatusText(f"Transcribing audio...")
+            
+            # Start transcription in a thread
+            threading.Thread(target=self.transcribe_audio, args=(audio_path,), daemon=True).start()
+    
+    def transcribe_audio(self, audio_path, language=None):
+        """Transcribe audio file using OpenAI's Whisper API."""
+        try:
+            if not self.client:
+                error_msg = "Error: OpenAI client not initialized"
+                self.transcript = error_msg
+                return error_msg
+            
+            self.update_status("Transcribing audio...", percent=10)
+            
+            # Get file extension for validation
+            file_ext = os.path.splitext(audio_path)[1].lower()
+            supported_formats = ['.flac', '.m4a', '.mp3', '.mp4', '.mpeg', '.mpga', '.oga', '.ogg', '.wav', '.webm']
+            
+            # Check if format needs conversion
+            if file_ext not in supported_formats:
+                self.update_status(f"File format {file_ext} not directly supported, attempting conversion...", percent=5)
+                try:
+                    audio_path = self.convert_audio_file(audio_path)
+                except Exception as e:
+                    raise ValueError(f"Unable to convert unsupported file format: {str(e)}")
+            
+            # M4A files often have issues with OpenAI API, try to convert them automatically
+            if file_ext == '.m4a':
+                self.update_status("M4A files can have compatibility issues, attempting to convert for better results...", percent=5)
+                try:
+                    audio_path = self.convert_audio_file(audio_path)
+                except Exception as e:
+                    self.update_status("Could not convert M4A file. Attempting to use original file...", percent=10)
+            
+            with open(audio_path, "rb") as audio_file:
+                response = self.client.audio.transcriptions.create(
+                    file=audio_file,
+                    model=WHISPER_MODEL,
+                    language=language
+                )
+            
+            self.update_status("Transcription complete", percent=100)
+            self.transcript = response.text  # Store the transcript as an attribute
+            return response.text
+        except Exception as e:
+            error_msg = f"Error: {str(e)}"
+            self.update_status(f"Error transcribing audio: {str(e)}", percent=0)
+            self.transcript = error_msg  # Set transcript to error message to avoid None
+            return error_msg
+            
+    def _get_ffmpeg_install_instructions(self):
+        """Return platform-specific FFmpeg installation instructions."""
+        import platform
+        system = platform.system().lower()
+        
+        if system == 'darwin':  # macOS
+            return "On macOS:\n1. Install Homebrew from https://brew.sh if you don't have it\n2. Run: brew install ffmpeg"
+        elif system == 'windows':
+            return "On Windows:\n1. Download from https://ffmpeg.org/download.html\n2. Add to PATH or use a package manager like Chocolatey (choco install ffmpeg)"
+        elif system == 'linux':
+            return "On Linux:\n- Ubuntu/Debian: sudo apt install ffmpeg\n- Fedora: sudo dnf install ffmpeg\n- Arch: sudo pacman -S ffmpeg"
+        else:
+            return "Please download FFmpeg from https://ffmpeg.org/download.html"
+
     def _fallback_speaker_detection(self):
         """Use a basic approach to detect speakers when diarization is not available"""
         paragraphs = self.transcript.split("\n\n")
@@ -1472,6 +2156,7 @@ class MainFrame(wx.Frame):
         if new_api_key != self.api_key:
             self.api_key = new_api_key
             os.environ["OPENAI_API_KEY"] = self.api_key
+            self.config_manager.set_api_key(new_api_key)
             
             # Update client
             if self.api_key:
@@ -1484,12 +2169,16 @@ class MainFrame(wx.Frame):
         if new_hf_token != self.hf_token:
             self.hf_token = new_hf_token
             os.environ["HF_TOKEN"] = self.hf_token
+            self.config_manager.set_pyannote_token(new_hf_token)
         
         # Update language if changed
         if new_language != self.language:
             self.language = new_language
             os.environ["TRANSCRIPTION_LANGUAGE"] = self.language
+            self.config_manager.set_language(new_language)
         
+        # Save settings to config file
+        wx.MessageBox("Settings saved successfully.", "Success", wx.OK | wx.ICON_INFORMATION)
         self.status_bar.SetStatusText("Settings saved successfully")
 
     def _identify_speakers_chunked(self, paragraphs, chunk_size):
@@ -2086,6 +2775,52 @@ class MainFrame(wx.Frame):
         try:
             # Get file extension for better error reporting
             file_ext = os.path.splitext(file_path)[1].lower()
+            supported_formats = ['.flac', '.m4a', '.mp3', '.mp4', '.mpeg', '.mpga', '.oga', '.ogg', '.wav', '.webm']
+            
+            # Check if file format is supported
+            if file_ext not in supported_formats:
+                # Attempt to convert to WAV if FFmpeg is available
+                if self._is_ffmpeg_available():
+                    wx.CallAfter(self.update_status, f"Converting {file_ext} file to WAV format...", percent=10)
+                    try:
+                        output_path = os.path.splitext(file_path)[0] + ".wav"
+                        subprocess.run(
+                            ["ffmpeg", "-i", file_path, "-y", output_path],
+                            stdout=subprocess.PIPE, 
+                            stderr=subprocess.PIPE,
+                            check=True
+                        )
+                        wx.CallAfter(self.update_status, f"Conversion complete. Starting transcription...", percent=20)
+                        file_path = output_path
+                    except Exception as e:
+                        error_msg = f"Error converting file: {str(e)}"
+                        wx.CallAfter(wx.MessageBox, error_msg, "Conversion Error", wx.OK | wx.ICON_ERROR)
+                        wx.CallAfter(self.update_status, "Ready", percent=0)
+                        wx.CallAfter(self.transcribe_btn.Enable)
+                        return
+                else:
+                    error_msg = f"The file format {file_ext} is not supported by OpenAI's Whisper API.\n\nSupported formats: {', '.join(supported_formats)}"
+                    wx.CallAfter(wx.MessageBox, error_msg, "Unsupported Format", wx.OK | wx.ICON_ERROR)
+                    wx.CallAfter(self.update_status, "Ready", percent=0)
+                    wx.CallAfter(self.transcribe_btn.Enable)
+                    return
+            
+            # For M4A files that often have issues, try to convert to WAV if FFmpeg is available
+            if file_ext == '.m4a' and self._is_ffmpeg_available():
+                wx.CallAfter(self.update_status, "Converting M4A to WAV format for better compatibility...", percent=10)
+                try:
+                    output_path = os.path.splitext(file_path)[0] + ".wav"
+                    subprocess.run(
+                        ["ffmpeg", "-i", file_path, "-y", output_path],
+                        stdout=subprocess.PIPE, 
+                        stderr=subprocess.PIPE,
+                        check=True
+                    )
+                    wx.CallAfter(self.update_status, "Conversion complete. Starting transcription...", percent=20)
+                    file_path = output_path
+                except Exception as e:
+                    # Continue with original file, just log the warning
+                    wx.CallAfter(self.update_status, f"Warning: Could not convert M4A file. Attempting to use original file.", percent=20)
             
             response = self.audio_processor.transcribe_audio(file_path, language)
             
@@ -2130,16 +2865,31 @@ class MainFrame(wx.Frame):
             error_msg = str(e)
             title = "API Error"
             
-            if "Invalid file format" in error_msg and file_ext == '.m4a':
-                error_msg = (
-                    "Your M4A file format is not compatible with the OpenAI API.\n\n"
-                    "Possible solutions:\n"
-                    "1. Install FFmpeg on your system (required for m4a processing)\n"
-                    "2. Convert the file to WAV or MP3 format manually\n"
-                    "3. Try a different M4A file (some are more compatible than others)"
-                )
-                title = "M4A Format Error"
+            if "Invalid file format" in error_msg:
+                # Try to extract the current format from the error message
+                format_match = re.search(r"supported formats: \[(.*?)\]", error_msg.lower())
+                if format_match:
+                    supported = format_match.group(1)
+                else:
+                    supported = "flac, m4a, mp3, mp4, mpeg, mpga, oga, ogg, wav, webm"
                 
+                if file_ext == '.m4a':
+                    error_msg = (
+                        "Your M4A file format is not compatible with the OpenAI API.\n\n"
+                        "Possible solutions:\n"
+                        "1. Install FFmpeg on your system (required for m4a processing)\n"
+                        "2. Convert the file to WAV or MP3 format manually\n"
+                        "3. Try a different M4A file (some are more compatible than others)"
+                    )
+                    title = "M4A Format Error"
+                else:
+                    error_msg = (
+                        f"The file format {file_ext} is not supported or has compatibility issues.\n\n"
+                        f"Supported formats: {supported}\n\n"
+                        "Recommended: Convert your file to WAV format using FFmpeg."
+                    )
+                    title = "Format Error"
+                    
             wx.CallAfter(wx.MessageBox, error_msg, title, wx.OK | wx.ICON_ERROR)
         except Exception as e:
             error_msg = str(e)
@@ -2233,6 +2983,7 @@ class MainFrame(wx.Frame):
 
     def _is_ffmpeg_available(self):
         """Check if ffmpeg is available on the system."""
+        # First try the standard way (using PATH)
         try:
             subprocess.run(
                 ["ffmpeg", "-version"], 
@@ -2242,6 +2993,28 @@ class MainFrame(wx.Frame):
             )
             return True
         except (subprocess.SubprocessError, FileNotFoundError):
+            # On macOS, try common Homebrew path
+            if platform.system() == 'darwin':
+                common_mac_paths = [
+                    "/opt/homebrew/bin/ffmpeg",
+                    "/usr/local/bin/ffmpeg",
+                    "/opt/local/bin/ffmpeg"  # MacPorts
+                ]
+                
+                for path in common_mac_paths:
+                    try:
+                        subprocess.run(
+                            [path, "-version"],
+                            stdout=subprocess.PIPE, 
+                            stderr=subprocess.PIPE,
+                            check=True
+                        )
+                        # If found, update the PATH environment variable
+                        os.environ["PATH"] = os.path.dirname(path) + ":" + os.environ.get("PATH", "")
+                        return True
+                    except (subprocess.SubprocessError, FileNotFoundError):
+                        continue
+            
             return False
 
     def check_pyannote(self):
