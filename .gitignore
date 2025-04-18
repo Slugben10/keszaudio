@@ -3,4 +3,4 @@ run_app.sh
 run.py
 .venv/
 dist/
-build/
+build/config.json
